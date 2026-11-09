@@ -29,10 +29,75 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/krappaU/pokerogue-vita.git upstream
+          git init -q upstream
+          git -C upstream remote add origin https://github.com/krappaU/pokerogue-vita.git
+          git -C upstream fetch --depth 1 origin ddb27da6bc2260bcc009c80f1fea87ec18bd88c8
+          git -C upstream checkout -q --detach FETCH_HEAD
           git -C upstream rev-parse HEAD > UPSTREAM_COMMIT.txt
           cd upstream/runtime
           bash scripts/fetch_deps.sh
+
+      - name: Patch R36S controls and keep native on-screen keyboard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'R36S_PATCH_PY'
+          from pathlib import Path
+          p = Path("upstream/runtime/src/platform_sdl.c")
+          s = p.read_text(encoding="utf-8")
+          anchor = "static SDL_GameController *pads[4];\n"
+          helper = """static SDL_Keycode r36s_keyboard_for_button(Uint8 button) {
+              // R36S dArkOSRE: translate SDL game controller events to the game's keyboard controls.
+              switch (button) {
+              case SDL_CONTROLLER_BUTTON_A: return SDLK_RETURN;       // confirm
+              case SDL_CONTROLLER_BUTTON_B: return SDLK_BACKSPACE;   // cancel
+              case SDL_CONTROLLER_BUTTON_X: return SDLK_n;           // starter: nature
+              case SDL_CONTROLLER_BUTTON_Y: return SDLK_v;           // enemy details / variants
+              case SDL_CONTROLLER_BUTTON_DPAD_UP: return SDLK_UP;
+              case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return SDLK_DOWN;
+              case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return SDLK_LEFT;
+              case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return SDLK_RIGHT;
+              case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return SDLK_f;  // starter form
+              case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return SDLK_r; // starter shiny
+              case SDL_CONTROLLER_BUTTON_BACK: return SDLK_LSHIFT;    // stats details
+              case SDL_CONTROLLER_BUTTON_START: return SDLK_ESCAPE;   // main menu
+              case SDL_CONTROLLER_BUTTON_LEFTSTICK: return SDLK_EQUALS; // speed up
+              case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return SDLK_MINUS; // speed down
+              default: return SDLK_UNKNOWN;
+              }
+          }
+          """
+          assert s.count(anchor) == 1, "Ponto de insercao do mapeamento nao encontrado. Upstream mudou."
+          s = s.replace(anchor, anchor + "\n" + helper, 1)
+          needle = "        case SDL_MOUSEBUTTONDOWN:\n"
+          controller_handler = """        case SDL_CONTROLLERBUTTONDOWN:
+                  case SDL_CONTROLLERBUTTONUP: {
+                      // The native on-screen keyboard already reads the same pad; don't double input.
+                      if (osk_active()) continue;
+                      SDL_Keycode k = r36s_keyboard_for_button(e.cbutton.button);
+                      if (k == SDLK_UNKNOWN || !map_key(k, ev)) continue;
+                      ev->type = (e.type == SDL_CONTROLLERBUTTONDOWN) ? PEV_KEY_DOWN : PEV_KEY_UP;
+                      // Only hardware button name is logged, never text typed in login/password fields.
+                      host_log("[r36s-input] %s button=%u -> %s", ev->type == PEV_KEY_DOWN ? "DOWN" : "UP",
+                               (unsigned)e.cbutton.button, ev->code);
+                      return true;
+                  }
+          """
+          assert s.count(needle) == 1, "Ponto de insercao de eventos nao encontrado. Upstream mudou."
+          s = s.replace(needle, controller_handler + needle, 1)
+          p.write_text(s, encoding="utf-8")
+          
+          # The native SDL gamepad continues to work for OSK and the host launcher.
+          # Inside the browser shim expose only keyboard input to avoid double-presses in Phaser.
+          p = Path("upstream/runtime/js/input.js")
+          s = p.read_text(encoding="utf-8")
+          needle = "rt.frameHooks.push(() => { padSnapshot = pollPads(); });"
+          assert s.count(needle) == 1, "A API do gamepad mudou no upstream. Revisar antes de compilar."
+          s = s.replace(needle,
+              'rt.frameHooks.push(() => { padSnapshot = [null, null, null, null]; }); // R36S: SDL buttons -> DOM keyboard', 1)
+          p.write_text(s, encoding="utf-8")
+          print("R36S patch: SDL controller-to-keyboard enabled; in-game JS gamepad suppressed; OSK preserved.")
+          R36S_PATCH_PY
 
       - name: Build native Linux ARM64 runtime
         shell: bash
@@ -109,6 +174,40 @@ jobs:
           } > "$LOG" 2>&1
           POKEROGUE_BOOT_EOF
           chmod 755 'package/ports/PokeRogue 4 - Teste Boot.sh'
+          # V4: keeps the previous launcher and adds a control test that logs hardware buttons.
+          cp 'package/ports/PokeRogue 4 - Teste Boot.sh' 'package/ports/PokeRogue 5 - Teste Controles.sh'
+          sed -i \
+            -e 's@pokerogue-r36s-boot-v3.txt@pokerogue-r36s-controles-v4.txt@g' \
+            -e 's@Teste Boot V3@Teste Controles V4@g' \
+            -e 's/180 segundos/300 segundos/g' \
+            -e 's/180s/300s/g' \
+            -e 's/180 s/300 s/g' \
+            'package/ports/PokeRogue 5 - Teste Controles.sh'
+          chmod 755 'package/ports/PokeRogue 5 - Teste Controles.sh'
+          cat > 'package/ports/pokerogue-r36s/CONTROLES-R36S-V4.txt' <<'EOF_R36S_KEYS'
+          Teste de controles R36S V4 / dArkOSRE
+          ------------------------------------
+          Direcional: setas
+          Botao A: confirmar (Enter)
+          Botao B: cancelar (Backspace)
+          Start: menu (Esc)
+          Select: detalhes (Shift)
+          X: Natureza (N) nos iniciais
+          Y: Informacoes inimigas/variantes (V)
+          L1: formas (F)
+          R1: shiny (R)
+          L3: velocidade + (=)
+          R3: velocidade - (-)
+
+          LOGIN: o teclado virtual integrado ja existe no runtime, ativado por osk=1.
+          No teclado virtual: A seleciona tecla, B apaga, Start confirma e Select cancela.
+          Esse teclado usa o gamepad SDL nativo; o modo teclado do jogo e separado.
+
+          O log de teste e ports/pokerogue-r36s-controles-v4.txt.
+          Pressionar botoes no jogo deve gerar linhas [r36s-input] DOWN/UP.
+          O teste encerra apos 300 s. O launcher PokeRogue R36S.sh nao tem limite.
+          A pasta data/ preserva conta, preferencias e cache. NAO apague nem envie dados de login.
+          EOF_R36S_KEYS
           cat > 'package/ports/PokeRogue R36S.sh' <<'POKEROGUE_PLAY_EOF'
           #!/bin/bash
           # SPDX-License-Identifier: AGPL-3.0-only
