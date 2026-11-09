@@ -145,6 +145,11 @@ jobs:
                       if (bind.bindType == SDL_CONTROLLER_BINDTYPE_BUTTON && bind.value.button == (int)j->button)
                           return targets[n];
                   }
+                  // dArkOSRE GO-Super Gamepad: raw Start=13, Select=12.
+                  // This joystick instance was verified to belong to an open game controller.
+                  // SDL reports both as unbound (type=NONE): explicit fallback is required.
+                  if (j->button == 13) return SDL_CONTROLLER_BUTTON_START;
+                  if (j->button == 12) return SDL_CONTROLLER_BUTTON_BACK;
               }
               return SDL_CONTROLLER_BUTTON_INVALID;
           }
@@ -435,6 +440,94 @@ jobs:
           } > "$LOG" 2>&1
           R36S_PROBE_SH
           chmod 755 'package/ports/PokeRogue 7 - Diagnostico Start.sh'
+          cat > 'package/ports/PokeRogue 9 - Teste Menor Latencia.sh' <<'R36S_FAST_EOF'
+          #!/bin/bash
+          # v7 experimental A/B performance profile, safe rollback of config.txt.
+          set -u
+          HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+          APP="$HERE/pokerogue-r36s"
+          DATA="$APP/data"
+          CONFIG="$DATA/config.txt"
+          BACKUP="$DATA/config.txt.pkrg-v7-backup"
+          LOG="$HERE/pokerogue-r36s-latencia-v7.txt"
+          mkdir -p "$DATA"
+          restore_config() {
+            if [ -f "$BACKUP" ]; then
+              cp -p "$BACKUP" "$CONFIG" && rm -f "$BACKUP"
+            fi
+          }
+          # Recover from a previous power loss during the short A/B benchmark.
+          if [ -f "$BACKUP" ]; then
+            echo 'Restaurando config anterior interrompida...' >> "$LOG"
+            restore_config || exit 1
+          fi
+          if [ ! -f "$CONFIG" ]; then
+            cat > "$CONFIG" <<'R36S_DEFAULT_CONFIG'
+          online=1
+          osk=1
+          fps30=1
+          audio=0
+          log=1
+          R36S_DEFAULT_CONFIG
+          fi
+          cp -p "$CONFIG" "$BACKUP" || exit 1
+          trap 'restore_config' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          if grep -Eq '^[[:space:]]*fps30=' "$CONFIG"; then
+            sed -i 's/^[[:space:]]*fps30=.*/fps30=0/' "$CONFIG"
+          else
+            printf '\nfps30=0\n' >> "$CONFIG"
+          fi
+          {
+            echo '==== PokeRogue R36S / Menor Latencia V7 (A/B) ===='
+            date -u '+UTC: %F %T' || true
+            echo 'Temporary test: fps30=0, 180 seconds max; original config restored on exit.'
+            echo 'This tests the runtime frame cap; it does NOT guarantee reduced input latency.'
+            if [ ! -x "$APP/pokerogue-rt" ] || [ ! -f "$APP/js/bootstrap.js" ]; then
+              echo 'ERRO: runtime ou JS do jogo nao encontrado.'
+              exit 126
+            fi
+            export SDL_VIDEODRIVER=kmsdrm
+            export LD_LIBRARY_PATH="$APP/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export SDL_GAMECONTROLLER_ALLOW_BACKGROUND_EVENTS=1
+            cd "$APP" || exit 1
+            if command -v timeout >/dev/null 2>&1; then
+              timeout --signal=TERM --kill-after=5s 180s ./pokerogue-rt --js "$APP/js" --data "$APP/data" --size 640x480
+              status=$?
+            else
+              echo 'AVISO: timeout nao encontrado; encerre pelo atalho START+SELECT.'
+              ./pokerogue-rt --js "$APP/js" --data "$APP/data" --size 640x480
+              status=$?
+            fi
+            echo "runtime_exit=$status"
+            echo '==== FIM ===='
+          } > "$LOG" 2>&1
+          R36S_FAST_EOF
+          chmod 755 'package/ports/PokeRogue 9 - Teste Menor Latencia.sh'
+          cat > 'package/ports/PokeRogue 10 - Restaurar Config.sh' <<'R36S_RESTORE_EOF'
+          #!/bin/bash
+          set -u
+          HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+          DATA="$HERE/pokerogue-r36s/data"
+          if [ -f "$DATA/config.txt.pkrg-v7-backup" ]; then
+            cp -p "$DATA/config.txt.pkrg-v7-backup" "$DATA/config.txt" &&
+            rm -f "$DATA/config.txt.pkrg-v7-backup"
+          fi
+          echo 'Configuração original preservada/restaurada. Nenhum dado de login foi removido.'
+          sleep 2
+          R36S_RESTORE_EOF
+          chmod 755 'package/ports/PokeRogue 10 - Restaurar Config.sh'
+          cat > 'package/ports/pokerogue-r36s/CONTROLES-R36S-V7.txt' <<'R36S_V7_NOTES'
+          dArkOSRE: START raw=13 -> M (menu); SELECT raw=12 -> Shift (detalhes)
+          D-pad: setas; A: Enter; B: Backspace. START + SELECT encerra o app.
+          Os dois botoes Start/Select nao estao mapeados pelo SDL_GameController.
+          V7 os reconhece diretamente pelo evento SDL_JOYBUTTONDOWN/UP, apenas no joystick associado.
+          Teste de menor latencia: fps30=0 somente durante o launcher 9 (180 s).
+          O launcher normal continua usando a configuracao anterior. O script 10 restaura caso necessite.
+          Para comparar, jogue a mesma batalha no launcher 8 (padrao) e no launcher 9 (teste).
+          Nao envie a pasta data, cookies, senhas, tokens ou arquivos de conta.
+          R36S_V7_NOTES
           cat > package/ports/pokerogue-r36s/CONTROLES-R36S-V6.txt <<'V6_CONTROL_EOF'
           R36S v6 - Start/Select physical input fallback
           A = Confirm; B = Cancel; D-pad = Arrow keys
@@ -446,7 +539,7 @@ jobs:
           NOTE: data/ contains private account details; do not share this folder.
           V6_CONTROL_EOF
           cat > package/INSTRUCOES-PORT.txt <<'POKEROGUE_README_EOF'
-          POKEROGUE R36S / dArkOSRE - BUILD V6 (Start menu e diagnostico)
+          POKEROGUE R36S / dArkOSRE - BUILD V7 (Start fix + teste de latencia)
           =============================================================
           Este ZIP ainda NAO contem o jogo nem um executavel ARM64.
           A compilacao e feita pelo GitHub Actions; o workflow agora gera os lancadores
@@ -457,11 +550,11 @@ jobs:
           2. Clique no lapis (Edit) e substitua TODO o conteudo pelo YAML desta versao.
           3. Confirme a alteracao (Commit changes).
           4. Abra Actions > PokeRogue R36S - build ARM64 experimental > Run workflow.
-          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-v6-menu.
+          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-v7-latencia.
           6. Extraia o ZIP interno e copie o conteudo de ports/ para ports/ do cartao.
-          7. Execute Ports > PokeRogue 7 - Diagnostico Start (30 s), depois PokeRogue 8 - Teste Menu (240 s).
+          7. Execute Ports > PokeRogue 8 - Teste Menu e depois Ports > PokeRogue 9 - Teste Menor Latencia (180 s).
           8. Envie o status da nova execucao e, se falhar no R36S, o arquivo
-             pokerogue-r36s-start-v6.txt e pokerogue-r36s-menu-v6.txt; revise URLs,
+             pokerogue-r36s-menu-v6.txt e pokerogue-r36s-latencia-v7.txt; revise URLs,
              cookies, tokens e dados pessoais. NAO envie localStorage.json ou cookies.json.
 
           IMPORTANTE:
@@ -487,7 +580,7 @@ jobs:
       - name: Upload R36S artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PokeRogue-R36S-v6-menu
+          name: PokeRogue-R36S-v7-latencia
           path: PokeRogue_R36S_ARM64_EXPERIMENTAL.zip
           if-no-files-found: error
           retention-days: 14
