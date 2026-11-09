@@ -1,0 +1,75 @@
+name: PokeRogue R36S - build ARM64 experimental
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-r36s:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+
+      - name: Install ARM64 build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = 'aarch64'
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential cmake pkg-config git curl unzip ca-certificates \
+            libsdl2-dev libfaad-dev libcurl4-openssl-dev libssl-dev \
+            libgles2-mesa-dev libegl1-mesa-dev
+
+      - name: Fetch upstream PokeRogue Vita source and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/krappaU/pokerogue-vita.git upstream
+          git -C upstream rev-parse HEAD > UPSTREAM_COMMIT.txt
+          cd upstream/runtime
+          bash scripts/fetch_deps.sh
+
+      - name: Build native Linux ARM64 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S upstream/runtime -B upstream/runtime/build-r36s \
+            -DCMAKE_BUILD_TYPE=Release -DPKR_DEBUG=ON -DPKR_COMMIT="$(cat UPSTREAM_COMMIT.txt)"
+          cmake --build upstream/runtime/build-r36s --parallel 4
+          file upstream/runtime/build-r36s/pokerogue-rt
+          readelf -h upstream/runtime/build-r36s/pokerogue-rt | grep -E 'Class:|Machine:'
+
+      - name: Package launchers and native runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package/ports/pokerogue-r36s/lib package/ports/pokerogue-r36s/data
+          cp upstream/runtime/build-r36s/pokerogue-rt package/ports/pokerogue-r36s/
+          cp -a upstream/runtime/js package/ports/pokerogue-r36s/
+          cp upstream/LICENSE package/ports/pokerogue-r36s/LICENSE-UPSTREAM-AGPL3.txt
+          cp UPSTREAM_COMMIT.txt package/ports/pokerogue-r36s/
+          cp 'PokeRogue 4 - Teste Boot.sh' 'PokeRogue R36S.sh' package/ports/
+          cp INSTRUCOES-PORT.txt package/
+          # A biblioteca AAC costuma nao estar no firmware; inclua a versao ARM64 do build.
+          LIBFAAD="$(ldconfig -p | awk '/libfaad.so.2 / {print $NF; exit}')"
+          if [ -n "$LIBFAAD" ] && [ -f "$LIBFAAD" ]; then
+            cp -L "$LIBFAAD" package/ports/pokerogue-r36s/lib/libfaad.so.2
+          fi
+          printf 'libfaad2: biblioteca de decodificacao AAC (GPL-2.0-ou-posterior).\nFonte: https://github.com/knik0/faad2\nPacote: libfaad2 do Ubuntu 24.04 ARM64.\n' \
+            > package/ports/pokerogue-r36s/lib/ORIGEM-FAAD.txt
+          (cd package/ports/pokerogue-r36s && sha256sum pokerogue-rt > SHA256SUMS.txt)
+          ldd package/ports/pokerogue-r36s/pokerogue-rt > package/DEPENDENCIAS-BUILD.txt || true
+          (cd package && zip -qr ../PokeRogue_R36S_ARM64_EXPERIMENTAL.zip .)
+
+      - name: Upload R36S artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokeRogue-R36S-ARM64-experimental
+          path: PokeRogue_R36S_ARM64_EXPERIMENTAL.zip
+          if-no-files-found: error
+          retention-days: 14
