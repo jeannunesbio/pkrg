@@ -37,7 +37,7 @@ jobs:
           cd upstream/runtime
           bash scripts/fetch_deps.sh
 
-      - name: Patch R36S controls and keep native on-screen keyboard
+      - name: Patch R36S controls - fix stuck Enter during OSK
         shell: bash
         run: |
           set -euo pipefail
@@ -49,7 +49,7 @@ jobs:
           helper = """static SDL_Keycode r36s_keyboard_for_button(Uint8 button) {
               // R36S dArkOSRE: translate SDL game controller events to the game's keyboard controls.
               switch (button) {
-              case SDL_CONTROLLER_BUTTON_A: return SDLK_RETURN;       // confirm
+              case SDL_CONTROLLER_BUTTON_A: return SDLK_RETURN;       // confirm (key up must always be dispatched)
               case SDL_CONTROLLER_BUTTON_B: return SDLK_BACKSPACE;   // cancel
               case SDL_CONTROLLER_BUTTON_X: return SDLK_n;           // starter: nature
               case SDL_CONTROLLER_BUTTON_Y: return SDLK_v;           // enemy details / variants
@@ -68,18 +68,35 @@ jobs:
           }
           """
           assert s.count(anchor) == 1, "Ponto de insercao do mapeamento nao encontrado. Upstream mudou."
+          # Track mapped press state so OSK cannot leave a held key in the app.
+          helper += "\nstatic bool r36s_buttons_down[SDL_CONTROLLER_BUTTON_MAX] = {false};\n"
           s = s.replace(anchor, anchor + "\n" + helper, 1)
           needle = "        case SDL_MOUSEBUTTONDOWN:\n"
           controller_handler = """        case SDL_CONTROLLERBUTTONDOWN:
                   case SDL_CONTROLLERBUTTONUP: {
-                      // The native on-screen keyboard already reads the same pad; don't double input.
-                      if (osk_active()) continue;
-                      SDL_Keycode k = r36s_keyboard_for_button(e.cbutton.button);
+                      // SAFETY: never drop key-up when the on-screen keyboard opens.
+                      // v4 suppressed *both* down and up during OSK. If A/Enter down
+                      // opens OSK, its matching up was suppressed -> stuck Enter,
+                      // repeated submit and HTTP 429. OSK still receives native SDL buttons.
+                      bool osk = osk_active();
+                      Uint8 button = e.cbutton.button;
+                      if (button >= SDL_CONTROLLER_BUTTON_MAX) continue;
+                      if (e.type == SDL_CONTROLLERBUTTONDOWN) {
+                          if (osk) continue; // OSK owns presses while visible.
+                          if (r36s_buttons_down[button]) continue; // no repeat downs.
+                          r36s_buttons_down[button] = true;
+                      } else {
+                          // Release is critical EVEN when OSK is active.
+                          // An unpaired 'up' is harmless to the game's keyboard shim.
+                          r36s_buttons_down[button] = false;
+                      }
+                      SDL_Keycode k = r36s_keyboard_for_button(button);
                       if (k == SDLK_UNKNOWN || !map_key(k, ev)) continue;
                       ev->type = (e.type == SDL_CONTROLLERBUTTONDOWN) ? PEV_KEY_DOWN : PEV_KEY_UP;
-                      // Only hardware button name is logged, never text typed in login/password fields.
-                      host_log("[r36s-input] %s button=%u -> %s", ev->type == PEV_KEY_DOWN ? "DOWN" : "UP",
-                               (unsigned)e.cbutton.button, ev->code);
+                      host_log("[r36s-input-v5] %s button=%u -> %s osk=%d ticks=%u",
+                               ev->type == PEV_KEY_DOWN ? "DOWN" : "UP",
+                               (unsigned)button, ev->code, osk ? 1 : 0,
+                               (unsigned)SDL_GetTicks());
                       return true;
                   }
           """
@@ -174,18 +191,15 @@ jobs:
           } > "$LOG" 2>&1
           POKEROGUE_BOOT_EOF
           chmod 755 'package/ports/PokeRogue 4 - Teste Boot.sh'
-          # V4: keeps the previous launcher and adds a control test that logs hardware buttons.
-          cp 'package/ports/PokeRogue 4 - Teste Boot.sh' 'package/ports/PokeRogue 5 - Teste Controles.sh'
+          # V5: 180-s keyboard test. DO NOT ATTEMPT TO LOG IN during this test.
+          cp 'package/ports/PokeRogue 4 - Teste Boot.sh' 'package/ports/PokeRogue 6 - Teste Teclado.sh'
           sed -i \
-            -e 's@pokerogue-r36s-boot-v3.txt@pokerogue-r36s-controles-v4.txt@g' \
-            -e 's@Teste Boot V3@Teste Controles V4@g' \
-            -e 's/180 segundos/300 segundos/g' \
-            -e 's/180s/300s/g' \
-            -e 's/180 s/300 s/g' \
-            'package/ports/PokeRogue 5 - Teste Controles.sh'
-          chmod 755 'package/ports/PokeRogue 5 - Teste Controles.sh'
-          cat > 'package/ports/pokerogue-r36s/CONTROLES-R36S-V4.txt' <<'EOF_R36S_KEYS'
-          Teste de controles R36S V4 / dArkOSRE
+            -e 's@pokerogue-r36s-boot-v3.txt@pokerogue-r36s-teclado-v5.txt@g' \
+            -e 's@Teste Boot V3@Teste Teclado V5@g' \
+            'package/ports/PokeRogue 6 - Teste Teclado.sh'
+          chmod 755 'package/ports/PokeRogue 6 - Teste Teclado.sh'
+          cat > 'package/ports/pokerogue-r36s/CONTROLES-R36S-V5.txt' <<'EOF_R36S_KEYS'
+          Teste seguro de teclado R36S V5 / dArkOSRE
           ------------------------------------
           Direcional: setas
           Botao A: confirmar (Enter)
@@ -199,19 +213,20 @@ jobs:
           L3: velocidade + (=)
           R3: velocidade - (-)
 
-          LOGIN: o teclado virtual integrado ja existe no runtime, ativado por osk=1.
+          LOGIN: NAO DIGITE SENHA NEM TENTE SE AUTENTICAR NA V5.
+          Teste o campo do usuario, abra o teclado virtual e use Select para cancelar.
           No teclado virtual: A seleciona tecla, B apaga, Start confirma e Select cancela.
-          Esse teclado usa o gamepad SDL nativo; o modo teclado do jogo e separado.
+          A V5 preserva a soltura do Enter mesmo com o teclado virtual aberto.
 
-          O log de teste e ports/pokerogue-r36s-controles-v4.txt.
-          Pressionar botoes no jogo deve gerar linhas [r36s-input] DOWN/UP.
-          O teste encerra apos 300 s. O launcher PokeRogue R36S.sh nao tem limite.
+          O log de teste e ports/pokerogue-r36s-teclado-v5.txt.
+          Procure linhas [r36s-input-v5] DOWN e UP do botao 0, com osk=0/1.
+          O teste encerra apos 180 s. O launcher principal nao tem limite.
           A pasta data/ preserva conta, preferencias e cache. NAO apague nem envie dados de login.
           EOF_R36S_KEYS
           cat > 'package/ports/PokeRogue R36S.sh' <<'POKEROGUE_PLAY_EOF'
           #!/bin/bash
           # SPDX-License-Identifier: AGPL-3.0-only
-          # PokeRogue R36S experimental - launcher; requires upstream pokerogue-rt build.
+          # PokeRogue R36S experimental - launcher; V5 use the 6 - Teste Teclado script first.
           set -u
           HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
           APP="$HERE/pokerogue-r36s"
@@ -254,7 +269,7 @@ jobs:
           POKEROGUE_PLAY_EOF
           chmod 755 'package/ports/PokeRogue R36S.sh'
           cat > package/INSTRUCOES-PORT.txt <<'POKEROGUE_README_EOF'
-          POKEROGUE R36S / dArkOSRE - BUILD V3.1 (workflow autocontido)
+          POKEROGUE R36S / dArkOSRE - BUILD V5 (testa tecla Enter sem login)
           =============================================================
           Este ZIP ainda NAO contem o jogo nem um executavel ARM64.
           A compilacao e feita pelo GitHub Actions; o workflow agora gera os lancadores
@@ -265,11 +280,11 @@ jobs:
           2. Clique no lapis (Edit) e substitua TODO o conteudo pelo YAML desta versao.
           3. Confirme a alteracao (Commit changes).
           4. Abra Actions > PokeRogue R36S - build ARM64 experimental > Run workflow.
-          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-ARM64-experimental.
+          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-v5-teclado.
           6. Extraia o ZIP interno e copie o conteudo de ports/ para ports/ do cartao.
-          7. Execute primeiro Ports > PokeRogue 4 - Teste Boot (max 180 segundos).
+          7. Execute Ports > PokeRogue 6 - Teste Teclado (max 180 segundos).
           8. Envie o status da nova execucao e, se falhar no R36S, o arquivo
-             pokerogue-r36s-boot-v3.txt; revise antes URLs de autenticacao,
+             pokerogue-r36s-teclado-v5.txt; revise antes URLs de autenticacao,
              cookies, tokens e dados pessoais. NAO envie localStorage.json ou cookies.json.
 
           IMPORTANTE:
@@ -295,7 +310,7 @@ jobs:
       - name: Upload R36S artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PokeRogue-R36S-ARM64-experimental
+          name: PokeRogue-R36S-v5-teclado
           path: PokeRogue_R36S_ARM64_EXPERIMENTAL.zip
           if-no-files-found: error
           retention-days: 14
