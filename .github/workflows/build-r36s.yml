@@ -37,7 +37,7 @@ jobs:
           cd upstream/runtime
           bash scripts/fetch_deps.sh
 
-      - name: Patch R36S controls - fix stuck Enter during OSK
+      - name: Patch R36S controls - preserve OSK key release
         shell: bash
         run: |
           set -euo pipefail
@@ -60,7 +60,7 @@ jobs:
               case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return SDLK_f;  // starter form
               case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return SDLK_r; // starter shiny
               case SDL_CONTROLLER_BUTTON_BACK: return SDLK_LSHIFT;    // stats details
-              case SDL_CONTROLLER_BUTTON_START: return SDLK_ESCAPE;   // main menu
+              case SDL_CONTROLLER_BUTTON_START: return SDLK_m;        // menu: native M shortcut
               case SDL_CONTROLLER_BUTTON_LEFTSTICK: return SDLK_EQUALS; // speed up
               case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return SDLK_MINUS; // speed down
               default: return SDLK_UNKNOWN;
@@ -93,7 +93,7 @@ jobs:
                       SDL_Keycode k = r36s_keyboard_for_button(button);
                       if (k == SDLK_UNKNOWN || !map_key(k, ev)) continue;
                       ev->type = (e.type == SDL_CONTROLLERBUTTONDOWN) ? PEV_KEY_DOWN : PEV_KEY_UP;
-                      host_log("[r36s-input-v5] %s button=%u -> %s osk=%d ticks=%u",
+                      host_log("[r36s-input-v6] %s button=%u -> %s osk=%d ticks=%u",
                                ev->type == PEV_KEY_DOWN ? "DOWN" : "UP",
                                (unsigned)button, ev->code, osk ? 1 : 0,
                                (unsigned)SDL_GetTicks());
@@ -116,6 +116,140 @@ jobs:
           print("R36S patch: SDL controller-to-keyboard enabled; in-game JS gamepad suppressed; OSK preserved.")
           R36S_PATCH_PY
 
+      - name: Add Start/Select raw joystick fallback and diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'R36S_V6_PY'
+          from pathlib import Path
+          p = Path('upstream/runtime/src/platform_sdl.c')
+          s = p.read_text(encoding='utf-8')
+          anchor = 'static bool r36s_buttons_down[SDL_CONTROLLER_BUTTON_MAX] = {false};'
+          assert s.count(anchor) == 1, 'R36S v5 input patch not found; unexpected source version'
+          helper = r"""
+
+          // dArkOSRE fallback: some system buttons may arrive as SDL joystick
+          // events rather than SDL game controller events. Find their raw binding
+          // from the *actual* SDL controller mapping (do not guess button IDs).
+          static SDL_GameControllerButton r36s_system_button_from_joy(const SDL_JoyButtonEvent *j) {
+              for (int i = 0; i < 4; ++i) {
+                  SDL_GameController *p = pads[i];
+                  if (!p || !SDL_GameControllerGetAttached(p)) continue;
+                  SDL_Joystick *joy = SDL_GameControllerGetJoystick(p);
+                  if (!joy || SDL_JoystickInstanceID(joy) != j->which) continue;
+                  const SDL_GameControllerButton targets[2] = {
+                      SDL_CONTROLLER_BUTTON_START, SDL_CONTROLLER_BUTTON_BACK
+                  };
+                  for (int n = 0; n < 2; ++n) {
+                      SDL_GameControllerButtonBind bind = SDL_GameControllerGetBindForButton(p, targets[n]);
+                      if (bind.bindType == SDL_CONTROLLER_BINDTYPE_BUTTON && bind.value.button == (int)j->button)
+                          return targets[n];
+                  }
+              }
+              return SDL_CONTROLLER_BUTTON_INVALID;
+          }
+          """
+          s = s.replace(anchor, anchor + helper, 1)
+          needle = '        case SDL_CONTROLLERBUTTONDOWN:\n'
+          assert s.count(needle) == 1, 'Controller handler not unique in v5 patched source'
+          handler = r"""        case SDL_JOYBUTTONDOWN:
+                  case SDL_JOYBUTTONUP: {
+                      // Only system buttons (Start/Select). Other buttons still
+                      // go through the V5 controller keyboard path.
+                      SDL_GameControllerButton b = r36s_system_button_from_joy(&e.jbutton);
+                      if (b == SDL_CONTROLLER_BUTTON_INVALID) continue;
+                      bool osk = osk_active();
+                      if (e.type == SDL_JOYBUTTONDOWN) {
+                          if (osk || r36s_buttons_down[b]) continue;
+                          r36s_buttons_down[b] = true;
+                      } else {
+                          if (!r36s_buttons_down[b]) continue;
+                          r36s_buttons_down[b] = false;
+                      }
+                      SDL_Keycode k = r36s_keyboard_for_button((Uint8)b);
+                      if (k == SDLK_UNKNOWN || !map_key(k, ev)) continue;
+                      ev->type = e.type == SDL_JOYBUTTONDOWN ? PEV_KEY_DOWN : PEV_KEY_UP;
+                      host_log("[r36s-input-v6] %s button=%u -> %s osk=%d ticks=%u source=joystick raw=%u",
+                          ev->type == PEV_KEY_DOWN ? "DOWN" : "UP", (unsigned)b, ev->code,
+                          osk ? 1 : 0, (unsigned)SDL_GetTicks(), (unsigned)e.jbutton.button);
+                      return true;
+                  }
+          """
+          s = s.replace(needle, handler + needle, 1)
+          p.write_text(s, encoding='utf-8')
+          print('V6 patched: physical joystick fallback for Start/Select, deduplicated with controller input')
+          R36S_V6_PY
+
+      - name: Build standalone controller diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > r36s-button-probe.c <<'PROBE_C'
+          #include <SDL2/SDL.h>
+          #include <stdio.h>
+          #include <stdbool.h>
+          int main(void) {
+              if (SDL_Init(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
+                  fprintf(stderr, "SDL initialization error: %s\n", SDL_GetError());
+                  return 1;
+              }
+              SDL_JoystickEventState(SDL_ENABLE);
+              SDL_GameControllerEventState(SDL_ENABLE);
+              SDL_GameController *pad = NULL;
+              for (int i=0; i<SDL_NumJoysticks(); i++) {
+                  if (!SDL_IsGameController(i)) continue;
+                  pad = SDL_GameControllerOpen(i);
+                  if (pad) break;
+              }
+              printf("[probe] SDL version %d.%d.%d, gamepad=%s\n",
+                  SDL_MAJOR_VERSION,SDL_MINOR_VERSION,SDL_PATCHLEVEL,
+                  pad ? SDL_GameControllerName(pad) : "NOT FOUND");
+              if (pad) {
+                  SDL_GameControllerButton targets[2] = {SDL_CONTROLLER_BUTTON_START, SDL_CONTROLLER_BUTTON_BACK};
+                  for (int n=0; n<2; n++) {
+                      SDL_GameControllerButtonBind bind = SDL_GameControllerGetBindForButton(pad, targets[n]);
+                      printf("[probe] mapped %s: type=%d raw=%d\n",
+                          n==0 ? "START" : "BACK/SELECT", (int)bind.bindType,
+                          bind.bindType == SDL_CONTROLLER_BINDTYPE_BUTTON ? bind.value.button : -1);
+                  }
+              }
+              printf("[probe] Press START alone, then SELECT alone, then A. Capture lasts 30 seconds.\n");
+              fflush(stdout);
+              Uint32 start = SDL_GetTicks();
+              Uint8 lastStart=0, lastSelect=0;
+              while (SDL_GetTicks()-start < 30000) {
+                  SDL_Event e;
+                  while (SDL_PollEvent(&e)) {
+                      if (e.type == SDL_CONTROLLERBUTTONDOWN || e.type == SDL_CONTROLLERBUTTONUP)
+                          printf("[probe] controller %s button=%u ticks=%u\n",
+                              e.type == SDL_CONTROLLERBUTTONDOWN ? "DOWN" : "UP",(unsigned)e.cbutton.button,(unsigned)SDL_GetTicks());
+                      if (e.type == SDL_JOYBUTTONDOWN || e.type == SDL_JOYBUTTONUP)
+                          printf("[probe] joystick %s raw_button=%u instance=%d ticks=%u\n",
+                              e.type == SDL_JOYBUTTONDOWN ? "DOWN" : "UP",(unsigned)e.jbutton.button,(int)e.jbutton.which,(unsigned)SDL_GetTicks());
+                      if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)
+                          printf("[probe] keyboard %s key=%s ticks=%u\n",
+                              e.type == SDL_KEYDOWN ? "DOWN" : "UP",SDL_GetKeyName(e.key.keysym.sym),(unsigned)SDL_GetTicks());
+                  }
+                  if (pad && SDL_GameControllerGetAttached(pad)) {
+                      Uint8 s=SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_START);
+                      Uint8 b=SDL_GameControllerGetButton(pad,SDL_CONTROLLER_BUTTON_BACK);
+                      if (s!=lastStart || b!=lastSelect) {
+                          printf("[probe] poll START=%d SELECT=%d ticks=%u\n",(int)s,(int)b,(unsigned)SDL_GetTicks());
+                          lastStart=s; lastSelect=b;
+                      }
+                  }
+                  fflush(stdout);
+                  SDL_Delay(12);
+              }
+              if (pad) SDL_GameControllerClose(pad);
+              SDL_Quit();
+              puts("[probe] END");
+              return 0;
+          }
+          PROBE_C
+          cc -O2 -Wall -Wextra -o r36s-button-probe r36s-button-probe.c $(pkg-config --cflags --libs sdl2)
+          file r36s-button-probe
+
       - name: Build native Linux ARM64 runtime
         shell: bash
         run: |
@@ -131,6 +265,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p package/ports/pokerogue-r36s/lib package/ports/pokerogue-r36s/data
+          cp r36s-button-probe package/ports/pokerogue-r36s/
           test -f upstream/runtime/js/bootstrap.js
           cp upstream/runtime/build-r36s/pokerogue-rt package/ports/pokerogue-r36s/
           cp -a upstream/runtime/js package/ports/pokerogue-r36s/
@@ -219,7 +354,7 @@ jobs:
           A V5 preserva a soltura do Enter mesmo com o teclado virtual aberto.
 
           O log de teste e ports/pokerogue-r36s-teclado-v5.txt.
-          Procure linhas [r36s-input-v5] DOWN e UP do botao 0, com osk=0/1.
+          Procure linhas [r36s-input-v6] DOWN e UP do botao 0, com osk=0/1.
           O teste encerra apos 180 s. O launcher principal nao tem limite.
           A pasta data/ preserva conta, preferencias e cache. NAO apague nem envie dados de login.
           EOF_R36S_KEYS
@@ -268,8 +403,50 @@ jobs:
           } > "$LOG" 2>&1
           POKEROGUE_PLAY_EOF
           chmod 755 'package/ports/PokeRogue R36S.sh'
+          # V6: menu test lasts 240 seconds, starts from the existing online data folder.
+          cp 'package/ports/PokeRogue 6 - Teste Teclado.sh' 'package/ports/PokeRogue 8 - Teste Menu.sh'
+          sed -i \
+            -e 's@pokerogue-r36s-teclado-v5.txt@pokerogue-r36s-menu-v6.txt@g' \
+            -e 's@Teste Teclado V5@Teste Menu V6@g' \
+            -e 's@180s ./pokerogue-rt@240s ./pokerogue-rt@g' \
+            'package/ports/PokeRogue 8 - Teste Menu.sh'
+          chmod 755 'package/ports/PokeRogue 8 - Teste Menu.sh'
+          cat > 'package/ports/PokeRogue 7 - Diagnostico Start.sh' <<'R36S_PROBE_SH'
+          #!/bin/bash
+          set -u
+          HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+          APP="$HERE/pokerogue-r36s"
+          LOG="$HERE/pokerogue-r36s-start-v6.txt"
+          {
+            echo '===== R36S / Start button probe v6 ====='
+            date -u '+UTC: %F %T' || true
+            export SDL_VIDEODRIVER=dummy
+            export SDL_AUDIODRIVER=dummy
+            if [ ! -x "$APP/r36s-button-probe" ]; then
+              echo 'ERROR: r36s-button-probe missing'
+              exit 126
+            fi
+            if command -v timeout >/dev/null 2>&1; then
+              timeout --signal=TERM --kill-after=5s 35s "$APP/r36s-button-probe"
+            else
+              "$APP/r36s-button-probe"
+            fi
+            echo '===== END ====='
+          } > "$LOG" 2>&1
+          R36S_PROBE_SH
+          chmod 755 'package/ports/PokeRogue 7 - Diagnostico Start.sh'
+          cat > package/ports/pokerogue-r36s/CONTROLES-R36S-V6.txt <<'V6_CONTROL_EOF'
+          R36S v6 - Start/Select physical input fallback
+          A = Confirm; B = Cancel; D-pad = Arrow keys
+          START = M (game menu), SELECT = Shift (stats)
+          START + SELECT = exit (upstream emergency shortcut)
+          While typing in virtual keyboard, native Start confirms and Select cancels.
+          Log without credentials: ports/pokerogue-r36s-start-v6.txt
+          Runtime: ports/pokerogue-r36s-menu-v6.txt
+          NOTE: data/ contains private account details; do not share this folder.
+          V6_CONTROL_EOF
           cat > package/INSTRUCOES-PORT.txt <<'POKEROGUE_README_EOF'
-          POKEROGUE R36S / dArkOSRE - BUILD V5 (testa tecla Enter sem login)
+          POKEROGUE R36S / dArkOSRE - BUILD V6 (Start menu e diagnostico)
           =============================================================
           Este ZIP ainda NAO contem o jogo nem um executavel ARM64.
           A compilacao e feita pelo GitHub Actions; o workflow agora gera os lancadores
@@ -280,11 +457,11 @@ jobs:
           2. Clique no lapis (Edit) e substitua TODO o conteudo pelo YAML desta versao.
           3. Confirme a alteracao (Commit changes).
           4. Abra Actions > PokeRogue R36S - build ARM64 experimental > Run workflow.
-          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-v5-teclado.
+          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-v6-menu.
           6. Extraia o ZIP interno e copie o conteudo de ports/ para ports/ do cartao.
-          7. Execute Ports > PokeRogue 6 - Teste Teclado (max 180 segundos).
+          7. Execute Ports > PokeRogue 7 - Diagnostico Start (30 s), depois PokeRogue 8 - Teste Menu (240 s).
           8. Envie o status da nova execucao e, se falhar no R36S, o arquivo
-             pokerogue-r36s-teclado-v5.txt; revise antes URLs de autenticacao,
+             pokerogue-r36s-start-v6.txt e pokerogue-r36s-menu-v6.txt; revise URLs,
              cookies, tokens e dados pessoais. NAO envie localStorage.json ou cookies.json.
 
           IMPORTANTE:
@@ -310,7 +487,7 @@ jobs:
       - name: Upload R36S artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PokeRogue-R36S-v5-teclado
+          name: PokeRogue-R36S-v6-menu
           path: PokeRogue_R36S_ARM64_EXPERIMENTAL.zip
           if-no-files-found: error
           retention-days: 14
