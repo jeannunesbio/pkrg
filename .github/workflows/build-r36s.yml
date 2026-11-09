@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout build scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install ARM64 build dependencies
         shell: bash
@@ -49,14 +49,141 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p package/ports/pokerogue-r36s/lib package/ports/pokerogue-r36s/data
+          test -f upstream/runtime/js/bootstrap.js
           cp upstream/runtime/build-r36s/pokerogue-rt package/ports/pokerogue-r36s/
           cp -a upstream/runtime/js package/ports/pokerogue-r36s/
           cp upstream/LICENSE package/ports/pokerogue-r36s/LICENSE-UPSTREAM-AGPL3.txt
           cp UPSTREAM_COMMIT.txt package/ports/pokerogue-r36s/
-          cp 'PokeRogue 4 - Teste Boot.sh' 'PokeRogue R36S.sh' package/ports/
-          cp INSTRUCOES-PORT.txt package/
+          cat > 'package/ports/PokeRogue 4 - Teste Boot.sh' <<'POKEROGUE_BOOT_EOF'
+          #!/bin/bash
+          # SPDX-License-Identifier: AGPL-3.0-only
+          # Tempo de execucao limitado: diagnostico de inicializacao, NAO jogo completo.
+          set -u
+          HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+          APP="$HERE/pokerogue-r36s"
+          LOG="$HERE/pokerogue-r36s-boot-v3.txt"
+          mkdir -p "$APP/data"
+          if [ ! -f "$APP/data/config.txt" ]; then
+          cat > "$APP/data/config.txt" <<'CONF'
+          # Configuracao inicial do teste: o teclado embutido evita entrada via PC.
+          online=1
+          osk=1
+          fps30=1
+          audio=0
+          log=1
+          CONF
+          fi
+          {
+            echo '==== PokeRogue R36S / Teste Boot V3 ===='
+            date -u '+Data UTC: %F %T' 2>/dev/null || true
+            uname -rm
+            echo 'Versao e instalacao:'
+            head -c 80 "$APP/UPSTREAM_COMMIT.txt" 2>/dev/null || true
+            echo
+            if [ ! -x "$APP/pokerogue-rt" ]; then
+              echo 'ERRO: pokerogue-rt ausente. Use primeiro o pacote ARM64 gerado pelo GitHub Actions.'
+              exit 126
+            fi
+            if [ ! -f "$APP/js/bootstrap.js" ]; then
+              echo 'ERRO: js/bootstrap.js ausente.'
+              exit 126
+            fi
+            export SDL_VIDEODRIVER=kmsdrm
+            export LD_LIBRARY_PATH="$APP/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export SDL_GAMECONTROLLER_ALLOW_BACKGROUND_EVENTS=1
+            echo 'Conferindo bibliotecas:'
+            if command -v ldd >/dev/null 2>&1; then ldd "$APP/pokerogue-rt" | grep -E 'not found|libfaad|libSDL2|libcurl|libGLES' || true; fi
+            echo 'Inicio do runtime (limite de seguranca 180 segundos)...'
+            cd "$APP" || exit 1
+            if command -v timeout >/dev/null 2>&1; then
+              timeout --signal=TERM --kill-after=5s 180s ./pokerogue-rt --js "$APP/js" --data "$APP/data" --size 640x480
+              status=$?
+            else
+              ./pokerogue-rt --js "$APP/js" --data "$APP/data" --size 640x480
+              status=$?
+            fi
+            echo "runtime_exit=$status"
+            if [ "$status" -eq 124 ]; then echo 'Observacao: limite de 180 s do teste atingido; nao significa erro do jogo.'; fi
+            echo '==== FIM TESTE BOOT ===='
+            exit "$status"
+          } > "$LOG" 2>&1
+          POKEROGUE_BOOT_EOF
+          chmod 755 'package/ports/PokeRogue 4 - Teste Boot.sh'
+          cat > 'package/ports/PokeRogue R36S.sh' <<'POKEROGUE_PLAY_EOF'
+          #!/bin/bash
+          # SPDX-License-Identifier: AGPL-3.0-only
+          # PokeRogue R36S experimental - launcher; requires upstream pokerogue-rt build.
+          set -u
+          HERE="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
+          APP="$HERE/pokerogue-r36s"
+          LOG="$APP/ultimo-launcher.txt"
+          mkdir -p "$APP/data"
+          if [ ! -f "$APP/data/config.txt" ]; then
+          cat > "$APP/data/config.txt" <<'CONF'
+          # Teste R36S: modo online, teclado interno, audio desativado inicialmente.
+          online=1
+          osk=1
+          fps30=1
+          audio=0
+          log=1
+          CONF
+          fi
+          {
+            echo "==== PokeRogue R36S experimental ===="
+            date -u '+UTC: %F %T' || true
+            uname -rm
+            if [ ! -x "$APP/pokerogue-rt" ]; then
+              echo "ERRO: binario ARM64 nao encontrado no pacote: $APP/pokerogue-rt"
+              exit 126
+            fi
+            if [ ! -f "$APP/js/bootstrap.js" ]; then
+              echo "ERRO: arquivos JS do runtime nao encontrados em $APP/js"
+              exit 126
+            fi
+            echo 'Dependencias ausentes (se houver):'
+            if command -v ldd >/dev/null 2>&1; then ldd "$APP/pokerogue-rt" | grep -E 'not found' || true; fi
+            export SDL_VIDEODRIVER=kmsdrm
+            export LD_LIBRARY_PATH="$APP/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export SDL_GAMECONTROLLER_ALLOW_BACKGROUND_EVENTS=1
+            echo 'Iniciando runtime em 640x480; arquivos de usuario permanecem em pokerogue-r36s/data.'
+            cd "$APP" || exit 1
+            ./pokerogue-rt --js "$APP/js" --data "$APP/data" --size 640x480
+            status=$?
+            echo "pokerogue-rt terminou com codigo $status"
+            exit "$status"
+          } > "$LOG" 2>&1
+          POKEROGUE_PLAY_EOF
+          chmod 755 'package/ports/PokeRogue R36S.sh'
+          cat > package/INSTRUCOES-PORT.txt <<'POKEROGUE_README_EOF'
+          POKEROGUE R36S / dArkOSRE - BUILD V3.1 (workflow autocontido)
+          =============================================================
+          Este ZIP ainda NAO contem o jogo nem um executavel ARM64.
+          A compilacao e feita pelo GitHub Actions; o workflow agora gera os lancadores
+          por conta propria, sem exigir arquivos na raiz do repositorio.
+
+          COMO USAR:
+          1. No repositorio pkrg, abra .github/workflows/build-r36s.yml.
+          2. Clique no lapis (Edit) e substitua TODO o conteudo pelo YAML desta versao.
+          3. Confirme a alteracao (Commit changes).
+          4. Abra Actions > PokeRogue R36S - build ARM64 experimental > Run workflow.
+          5. Quando finalizar, em Artifacts, baixe PokeRogue-R36S-ARM64-experimental.
+          6. Extraia o ZIP interno e copie o conteudo de ports/ para ports/ do cartao.
+          7. Execute primeiro Ports > PokeRogue 4 - Teste Boot (max 180 segundos).
+          8. Envie o status da nova execucao e, se falhar no R36S, o arquivo
+             pokerogue-r36s-boot-v3.txt; revise antes URLs de autenticacao,
+             cookies, tokens e dados pessoais. NAO envie localStorage.json ou cookies.json.
+
+          IMPORTANTE:
+          - Nao recompila no R36S, nao modifica o firmware.
+          - Requer conexao com a internet para modo online.
+          - Sucesso do build ainda NAO garante funcionamento do jogo ou do login.
+          - Se a etapa de compilacao falhar em outra versao do upstream, envie os
+            ultimos 30-50 linhas do passo que falhou.
+          - Fonte upstream: https://github.com/krappaU/pokerogue-vita
+          - Licenca do runtime: AGPL-3.0.
+          POKEROGUE_README_EOF
           # A biblioteca AAC costuma nao estar no firmware; inclua a versao ARM64 do build.
-          LIBFAAD="$(ldconfig -p | awk '/libfaad.so.2 / {print $NF; exit}')"
+          LIBFAAD="$(ldconfig -p | awk '/libfaad.so.2 / && !seen {path=$NF; seen=1} END {if (seen) print path}')"
           if [ -n "$LIBFAAD" ] && [ -f "$LIBFAAD" ]; then
             cp -L "$LIBFAAD" package/ports/pokerogue-r36s/lib/libfaad.so.2
           fi
